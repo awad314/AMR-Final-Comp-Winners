@@ -85,29 +85,6 @@ noRobotCount = 0;
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Initialize needed data:
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-% Get the data
-data = load('cornerMap.mat');
-% an n × 4 matrix consisting of known walls in the environment
-map = data.map;
-[n, ~] = size(map);
-% an m × 4 matrix consisting of optional walls
-optWalls = data.optWalls;
-[m, ~] = size(optWalls);
-% a k × 2 matrix of k waypoints given as [x, y]
-waypoints = data.waypoints;
-[k, ~] = size(waypoints);
-% j × 2 matrix of j waypoints given as [x, y]
-ECwaypoints = data.ECwaypoints;
-[j, ~] = size(ECwaypoints);
-% an b × 3 matrix where each row gives [tagN um, x, y] for a single beacon
-beaconLoc = data.beaconLoc;
-[b, ~] = size(beacomLoc);
-
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Control Function Factors and Other Set Up
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Initialize the sensor range
@@ -117,17 +94,68 @@ angles = transpose(angles);
 robotRadius = 0.2;
 
 % Wall offset
-off = robotRadius + 0.1;
+off = robotRadius + 0.15;
 
 % Define the sensor origin (from HW2)
 sensorPos = [offset_x, offset_y];
 
+alpha = 1;
+epsilon = 0.2;
 
+% Number of subsections to take on one line
+factor = 50;
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Initialize needed data:
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+% Get the data
+data = load('practiceMap_4credits_2023.mat');
 
+% an n × 4 matrix consisting of known walls in the environment
+map = data.map;
+mapBoundary = map(1:4, :);
 
-SetFwdVelAngVelCreate(Robot, 0, 0);
+map = map(5:end, :);
+[n, ~] = size(map);
+
+% an m × 4 matrix consisting of optional walls
+optWalls = data.optWalls;
+[m, ~] = size(optWalls);
+tempMap = [map; optWalls];
+
+optNodes = zeros(2*m, 3);
+
+for i = 1 : m
+    currWall = optWalls(i, :);
+    midPt = [0.5 * (currWall(1, 1) + currWall(1, 3)), 0.5 * (currWall(1, 2) + currWall(1, 4))];
+    wallLength = norm(currWall(1, [1, 2]) - currWall(1, [3, 4]));
+    orthoX = - (currWall(1, 4) - currWall(1, 2)) / wallLength;
+    orthoY = (currWall(1, 3) - currWall(1, 1)) / wallLength;
+    offPt1 = midPt + (off + 0.05).* [orthoX, orthoY];
+    offPt2 = midPt - (off + 0.05).* [orthoX, orthoY];
+    optNodes(2*i - 1, :) = [offPt1, i]; 
+    optNodes(2*i, :) = [offPt2, i];
+end
+
+% a k × 2 matrix of k waypoints given as [x, y]
+waypoints = data.waypoints;
+[k, ~] = size(waypoints);
+% Construct a new set of waypoints where optional wall waypoints can be
+% included; the 3rd column shows if the point is waypoint or wall
+waypoints = horzcat(waypoints, zeros(k, 1));
+
+% j × 2 matrix of j waypoints given as [x, y]
+ECwaypoints = data.ECwaypoints;
+[j, ~] = size(ECwaypoints);
+ECwaypoints = horzcat(ECwaypoints, -1 * ones(j, 1));
+
+allWaypoints = [waypoints; ECwaypoints; optNodes];
+
+% an b × 3 matrix where each row gives [tagN um, x, y] for a single beacon
+beaconLoc = data.beaconLoc;
+[b, ~] = size(beaconLoc);
+
 tic
 
 
@@ -149,7 +177,7 @@ dataStore.particles.weights = [];
 % The index of the current waypoint should be identified and returned as
 % currWaypoint
 
-
+% Return current loc as start
 
 
 
@@ -178,7 +206,7 @@ dataStore.ekfSigma = [toc, 2, 0, 0, 0, 2, 0, 0, 0, 0.1];
 % Initialize other dataStore fields
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % We assume all walls are there
-dataStore.map = [toc, ones(1, m)];
+dataStore.map = [toc, ones(1, m+n)];
 % We mark the current waypoint as visited
 dataStore.visited.waypoints = [toc, zeros(1, k)];
 % Update current waypoint as visited
@@ -190,17 +218,34 @@ dataStore.visited.ECwaypoints = [toc, zeros(1, j)];
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % First Roadmap + Find Path -> 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Shrink the map boundary inward by fac
+mapVertices = mapBoundary(:, [1, 2]);
+poly = polyshape(mapVertices(:, 1), mapVertices(:, 2));
+mapVertices = polybuffer(poly, -off, "JointType","square").Vertices;
 
+% Buffer the rest of the walls in the map and get new nodes
+[newXv, newYv, newMap, nodes] = bufferObstacle(tempMap, off, mapVertices);
+% Get the basic visibility roadmap
+edgeMatrix = createRoadmap(newMap, newXv, newYv, nodes, factor);
 
+% Start from the nearest next waypoint
+[iterNum, ~] = size(allWaypoints);
+path = [];
+weightDis = intmax;
 
+% Select the first waypoint to visited -- Least cost
+for i = 1 : iterNum
+    [pathNodes, d] = findPath(newMap, nodes, edgeMatrix, start, allWaypoints(i, [1, 2]), newXv, newYv, factor);
+    if d < weightDis
+        goal = allWaypoints(i, [1, 2]);
+        weightDis = d;
+        path = pathNodes;
+    end
+end
 
+gotopt = 1;
 
-
-
-
-
-
-
+SetFwdVelAngVelCreate(Robot, 0, 0);
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -258,16 +303,41 @@ while toc < maxTime
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     % CONTROL FUNCTION
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    % Set initial forward and angular velocity
-    fwdVel = 0.5;
-    angVel = -0.3;
-    [cmdV, cmdW] =limitCmds(fwdVel, angVel, 0.5, 1.3);
+    currentPoseX = dataStore.ekfMu(end, 2);
+    currentPoseY = dataStore.ekfMu(end, 3);
+    currentTheta = dataStore.ekfMu(end, 4);
+
+    nextPt = allWaypoints(gotopt,:);
+    waypointX = nextPt(1,1);
+    waypointY = nextPt(1,2);
+    cmdVx = waypointX - currentPoseX;
+    cmdVy = waypointY - currentPoseY;
+    
+    if sqrt((cmdVx)^2+(cmdVy)^2)<=closeEnough
+        gotopt = gotopt+1;
+        if gotopt > length(waypoints)
+            cmdVx = 0;
+            cmdVy = 0;
+        else
+            waypointNext = waypoints(gotopt,:);
+            waypointX = waypointNext(1,1);
+            waypointY = waypointNext(1,2);
+            cmdVx = (waypointX - currentPoseX)/alpha;
+            cmdVy = (waypointY - currentPoseY)/alpha;
+        end
+    end
+
+    [fwdVel, angVel] = feedbackLin(cmdVx,cmdVy,currentTheta,epsilon);
+    [cmdV, cmdW] = limitCmds(fwdVel, angVel, 0.5, 0.2);
     
     % if overhead localization loses the robot for too long, stop it
     if noRobotCount >= 3
         SetFwdVelAngVelCreate(Robot, 0,0);
     
-    else 
+    elseif cmdVx == 0 && cmdVy == 0
+
+    
+    else
         SetFwdVelAngVelCreate(Robot, cmdV, cmdW);
        
     end
