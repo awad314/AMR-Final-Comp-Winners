@@ -219,14 +219,24 @@ dataStore.visited.ECwaypoints = [toc, zeros(1, j)];
 % First Roadmap + Find Path -> 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Shrink the map boundary inward by fac
-mapVertices = mapBoundary(:, [1, 2]);
+mapVerticesTemp = mapBoundary(:, [1, 2]);
+theta = [];
+for i = 1 : 4
+    theta(i, 1) = mapVerticesTemp(i, 2)/mapVerticesTemp(i, 1);
+end
+[B, I] = sort(theta);
+mapVertices = zeros(mapVerticesTemp);
+for i = 1 : 4
+    mapVertices(i, :) = mapVerticesTemp(I(i), :);
+end
+
 poly = polyshape(mapVertices(:, 1), mapVertices(:, 2));
 mapVertices = polybuffer(poly, -off, "JointType","square").Vertices;
 
 % Buffer the rest of the walls in the map and get new nodes
 [newXv, newYv, newMap, nodes] = bufferObstacle(tempMap, off, mapVertices);
 % Get the basic visibility roadmap
-edgeMatrix = createRoadmap(newMap, newXv, newYv, nodes, factor);
+[edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
 
 % Start from the nearest next waypoint
 [iterNum, ~] = size(allWaypoints);
