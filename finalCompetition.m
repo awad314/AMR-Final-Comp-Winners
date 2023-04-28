@@ -53,7 +53,7 @@ dataStore = struct('truthPose', [],...
                    'logodds', [], ...
                    'map', [], ...
                    'particles', [],...
-                   'roadmap', [], ...
+                   'roadmap', {}, ...
                    'visited', []);
 
 % ekfMu: [toc x y theta]
@@ -124,8 +124,11 @@ optWalls = data.optWalls;
 [m, ~] = size(optWalls);
 tempMap = [map; optWalls];
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Opt Wall Nodes Construction
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% The third row is the opt wall index
 optNodes = zeros(2*m, 3);
-
 for i = 1 : m
     currWall = optWalls(i, :);
     midPt = [0.5 * (currWall(1, 1) + currWall(1, 3)), 0.5 * (currWall(1, 2) + currWall(1, 4))];
@@ -150,6 +153,12 @@ ECwaypoints = data.ECwaypoints;
 [j, ~] = size(ECwaypoints);
 ECwaypoints = horzcat(ECwaypoints, -1 * ones(j, 1));
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% allWaypoints Construction
+% k   rows    [waypoint, 0]
+% j   rows    [ECWaypoint, -1]
+% 2*m rows    [optWall, i]
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 allWaypoints = [waypoints; ECwaypoints; optNodes];
 
 % an b × 3 matrix where each row gives [tagN um, x, y] for a single beacon
@@ -220,21 +229,17 @@ dataStore.visited.ECwaypoints = [toc, zeros(1, j)];
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Shrink the map boundary inward by fac
 mapVerticesTemp = mapBoundary(:, [1, 2]);
-theta = [];
-for i = 1 : 4
-    theta(i, 1) = mapVerticesTemp(i, 2)/mapVerticesTemp(i, 1);
-end
-[B, I] = sort(theta);
-mapVertices = zeros(mapVerticesTemp);
-for i = 1 : 4
-    mapVertices(i, :) = mapVerticesTemp(I(i), :);
-end
+centroid = mean(mapVerticesTemp);
+translated = mapVerticesTemp - centroid;
+angles = atan2(translated(:,2), translated(:,1));
+[~, sorted] = sort(angles);
+mapVertices = mapVerticesTemp(sorted, :);
 
 poly = polyshape(mapVertices(:, 1), mapVertices(:, 2));
 mapVertices = polybuffer(poly, -off, "JointType","square").Vertices;
 
 % Buffer the rest of the walls in the map and get new nodes
-[newXv, newYv, newMap, nodes] = bufferObstacle(tempMap, off, mapVertices);
+[newXv, newYv, ~, nodes] = bufferMap(tempMap, off, off+0.05, mapVertices);
 % Get the basic visibility roadmap
 [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
 
@@ -245,15 +250,29 @@ weightDis = intmax;
 
 % Select the first waypoint to visited -- Least cost
 for i = 1 : iterNum
-    [pathNodes, d] = findPath(newMap, nodes, edgeMatrix, start, allWaypoints(i, [1, 2]), newXv, newYv, factor);
+    [pathNodes, d] = findPath(nodes, edgeMatrix, start, allWaypoints(i, [1, 2]), newXv, newYv, factor);
     if d < weightDis
+        goalIndex = i;
         goal = allWaypoints(i, [1, 2]);
         weightDis = d;
         path = pathNodes;
     end
 end
 
+[pr, pc] = size(path);
+dataStore.roadmap{1} = [toc reshape(path, 1, pr*pc)];
+rmUpdate = 2;
 gotopt = 1;
+
+[er, ~] = size(edges);
+hold on
+for i = 1 : pr-1
+    plot([path(i, 1), path(i+1, 1)], [path(i,2), path(i+1, 2)], 'b-');
+end
+hold on
+scatter(goal(1),goal(2), 'ro', 'LineWidth', 1.5);
+hold on
+scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
 
 SetFwdVelAngVelCreate(Robot, 0, 0);
 
@@ -313,32 +332,112 @@ while toc < maxTime
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     % CONTROL FUNCTION
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    currentPoseX = dataStore.ekfMu(end, 2);
-    currentPoseY = dataStore.ekfMu(end, 3);
-    currentTheta = dataStore.ekfMu(end, 4);
+    currentPoseX = dataStore.truthPose(end, 2);
+    currentPoseY = dataStore.truthPose(end, 3);
+    currentTheta = dataStore.truthPose(end, 4);
 
-    nextPt = allWaypoints(gotopt,:);
+    nextPt = path(gotopt,:);
     waypointX = nextPt(1,1);
     waypointY = nextPt(1,2);
     cmdVx = waypointX - currentPoseX;
     cmdVy = waypointY - currentPoseY;
     
-    if sqrt((cmdVx)^2+(cmdVy)^2)<=closeEnough
-        gotopt = gotopt+1;
-        if gotopt > length(waypoints)
-            cmdVx = 0;
-            cmdVy = 0;
+    if ~all(isnan(allWaypoints))
+        if sqrt((cmdVx)^2+(cmdVy)^2)<=closeEnough
+            gotopt = gotopt+1;
+            if gotopt <= length(path)
+                hold on
+                plot([path(gotopt-1, 1), path(gotopt, 1)], [path(gotopt-1, 2), path(gotopt, 2)]);
+            else
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                % Step 1: Stop when the waypoint is reached
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                SetFwdVelAngVelCreate(Robot, 0, 0);
+                cmdVx = 0;
+                cmdVy = 0;
+            
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                % Step 2: Identify what the waypoint belongs to
+                %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                % If normal waypoint
+                if goalIndex <= k
+                    lastWaypoints = dataStore.visited.waypoints(end, 2 : end);
+                    lastWaypoints(1, goalIndex) = 1;
+                    dataStore.visited.waypoints = [dataStore.visited.waypoints; toc lastWaypoints];
+                    % BeepRoombaCreate(Robot);
+                    allWaypoints(goalIndex, :) = nan;
+    
+                % If extraw waypoint
+                elseif goalIndex <= k+j
+                    lastECWaypoints = dataStore.visited.ECwaypoints(end, 2 : end);
+                    lastECWaypoints(1, goalIndex - k) = 1;
+                    dataStore.visited.ECwaypoints = [dataStore.visited.ECwaypoints; toc lastECWaypoints];
+                    % BeepRoombaCreate(Robot);
+                    allWaypoints(goalIndex, :) = nan;
+            
+                % If extra wall node indices
+                else
+                    lastMap = dataStore.map(end, 2 : end);
+                    optWallNum = ceil((goalIndex - k - j)/2);
+                    [f, ~] = find(allWaypoints(:, 3)==optWallNum);
+                    allWaypoints(f, :) = nan;
+                    if ~isthere(optWallNum)
+                        lastMap(1, optWallNum+n) = 0;
+                        dataStore.map = [dataStore.map; toc lastMap];
+
+                        % Remove not there opt walls
+                        newXv = [newXv(1:(n + optWallNum-1), :); newXv((n+optWallNum+1) : end, :)];
+                        newYv = [newYv(1:(n + optWallNum-1), :); newYv((n+optWallNum+1) : end, :)];
+                        % Remove not there opt walls' nodes
+                        [r, ~] = find(nodes(:, 3) == optWallNum+n);
+                        nodes = [nodes(1: (min(r) - 1), :); [nodes((max(r)+1) : end, 1:2), nodes((max(r)+1):end, 3)-1]];
+                        [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
+                        [pr, pc] = size(path);
+                        dataStore.roadmap{rmUpdate} = [toc reshape(path, 1, pr*pc)];
+                        rmUpdate = rmUpdate + 1;
+                    end
+                end
+                if ~all(isnan(allWaypoints))
+                    weightDis = Inf;
+                    start = dataStore.truthPose(end, [2,3]);
+                    for i = 1 : iterNum
+                    [pathNodes, d] = findPath(nodes, edgeMatrix, start, allWaypoints(i, [1, 2]), newXv, newYv, factor);
+                        if d < weightDis
+                            goalIndex = i;
+                            goal = allWaypoints(i, [1, 2]);
+                            weightDis = d;
+                            path = pathNodes;
+                        end
+                    end
+                gotopt = 1;
+                figure
+                for i = 1 : length(edges)
+                    hold on
+                    plot(edges(i, [1,3]), edges(i, [2, 4]), 'g-');
+                end
+                hold on
+                scatter(goal(1), goal(2), 'ro', 'LineWidth', 2);
+                hold on
+                scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
+                hold on
+                plotSquareMap(map);
+                else
+                    break
+                end
+            end
         else
-            waypointNext = waypoints(gotopt,:);
+            waypointNext = path(gotopt,:);
             waypointX = waypointNext(1,1);
             waypointY = waypointNext(1,2);
             cmdVx = (waypointX - currentPoseX)/alpha;
             cmdVy = (waypointY - currentPoseY)/alpha;
         end
+    else
+        SetFwdVelAngVelCreate(Robot, 0, o);
     end
 
     [fwdVel, angVel] = feedbackLin(cmdVx,cmdVy,currentTheta,epsilon);
-    [cmdV, cmdW] = limitCmds(fwdVel, angVel, 0.5, 0.2);
+    [cmdV, cmdW] = limitCmds(fwdVel, angVel, 0.2, 0.2); 
     
     % if overhead localization loses the robot for too long, stop it
     if noRobotCount >= 3
@@ -352,11 +451,6 @@ while toc < maxTime
        
     end
     
-
-
-
-
-
 
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     pause(0.1);
