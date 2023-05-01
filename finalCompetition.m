@@ -377,11 +377,54 @@ while toc < maxTime
             
                 % If extra wall node indices
                 else
-                    lastMap = dataStore.map(end, 2 : end);
-                    optWallNum = ceil((goalIndex - k - j)/2);
-                    [f, ~] = find(allWaypoints(:, 3)==optWallNum);
-                    allWaypoints(f, :) = nan;
-                    if ~isthere(optWallNum)
+                    
+                lastMap = dataStore.map(end, 2 : end);
+                optWallNum = ceil((goalIndex - k - j)/2);
+                [f, ~] = find(allWaypoints(:, 3)==optWallNum);
+                allWaypoints(f, :) = nan;
+                
+                %%%% Find Angle Needed to Turn to Face Wall %%%
+                
+                current_wall = optWalls(optWallNum);  
+                x1 = current_wall(1,1);
+                x2 = current_wall(1,3);
+                y1 = current_wall(1,2);
+                y2 = current_wall(1,4);
+                
+                theta = (180/pi)*currentTheta;
+                m = (y2-y1)/(x2-x1);
+                alpha = atand(m);
+                turn = alpha-theta+90;  
+                TurnCreate(Robot,0.2,turn);
+                if x1==x2
+                    [val,x,y] = intersectPoint(x1,y1,x2,y2,cPose(1),cPose(2),cPose(1)+10,cPose(2));
+                    if val==1
+                      continue
+                    else
+                      turn=180;
+                     TurnCreate(Robot,0.2,turn)
+                    end
+                 elseif y1==y2
+                  [val,x,y] = intersectPoint(x1,y1,x2,y2,cPose(1),cPose(2),cPose(1),cPose(2)+10);
+                  if val==1
+                    continue
+                  else
+                     turn=180;
+                     TurnCreate(Robot,0.2,turn)   
+                  end
+                end
+                TravelDistCreate(Robot,0.2,0.2);
+                bumped = dataStore.rsdepth(end,2:7);
+                if any(any(bumped))
+                     TravelDistCreate(Robot,-0.2,0.2);
+                     wall_here = 1;
+                     disp("WALL HERE")
+                else
+                    wall_here = 0;
+                    disp("WALL NOT HERE")
+                end                   
+
+                    if ~wall_here
                         lastMap(1, optWallNum+n) = 0;
                         dataStore.map = [dataStore.map; toc lastMap];
 
@@ -460,4 +503,3 @@ while toc < maxTime
 SetFwdVelAngVelCreate(Robot, 0, 0);
 
 end
-
