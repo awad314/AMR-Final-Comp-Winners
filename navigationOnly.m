@@ -281,6 +281,10 @@ while toc < maxTime
                     lastMap = dataStore.map(end, 2 : end);
                     optWallNum = ceil((goalIndex - k - j)/2);
                     [f, ~] = find(allWaypoints(:, 3)==optWallNum);
+                    twoNodes = allWaypoints(f, :);
+                    [sel, ~] = find(twoNodes == allWaypoints(goalIndex, :));
+                    otherPt = twoNodes(unique(sel));
+
                     allWaypoints(f, :) = nan;
 
                     currentWall = optWalls(optWallNum, :);  
@@ -288,41 +292,55 @@ while toc < maxTime
                     x2 = currentWall(1,3);
                     y1 = currentWall(1,2);
                     y2 = currentWall(1,4);
-                
-                    theta = (180/pi) * currentTheta;
-                    m = (y2-y1)/(x2-x1);
-                    lineAng = atand(m);
-                    if currentPoseY>min(y1,y2)
-                        turn = lineAng-theta-90
-                    elseif currentPoseX>min(x1,x2)
-                        turn = lineAng-theta-90
-                    end
-                        
-                    turn = lineAng-theta+90;  
-                    TurnCreate(Robot, 0.2, turn);
-                
+
+                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                    % Let the Robot turn to the Wall
+                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                    % If the wall is y orientation
                     if abs(x1-x2) <= 0.2
-                        [val,x,y] = intersectPoint(x1,y1,x2,y2, ...
-                            currentPoseX,currentPoseY,currentPoseX+10,currentPoseY);
-                        if val==0
-                            turn=180;
-                            TurnCreate(Robot,0.2,turn)
+                        % To the right
+                        if currentPoseX > min(x1, x2)
+                            if currentTheta >= 0
+                                TurnCreate(Robot, 0,2, rad2deg(pi-currentTheta));
+                            else
+                                TurnCreate(Robot, 0.2, -rad2deg((pi+currentTheta)));
+                            end
+                        % To the left
+                        else
+                            TurnCreate(Robot, 0.2, -rad2deg(currentTheta));
                         end
                     
-                    elseif abs(y1-y2) <= 0.2
-                        [val,x,y] = intersectPoint(x1,y1,x2,y2, ...
-                            currentPoseX,currentPoseY,currentPoseX,currentPoseY+10);
-                        if val==0
-                            turn=180;
-                            TurnCreate(Robot,0.2,turn)   
+                    % If the wall is x orientation
+                    else
+                        % To the top
+                        if currentPoseX > min(y1, y2)
+                            if abs(currentTheta) < pi/2
+                                TurnCreate(Robot, 0.2, rad2deg(-currentTheta-pi/2));
+                            elseif currentTheta > pi/2
+                                TurnCreate(Robot, 0.2, rad2deg(3/2*pi - currentTheta));
+                            else
+                                TurnCreate(Robot, 0.2, rad2deg(- currentTheta-pi/2));
+                            end
+                        % To the bottom
+                        else
+                            if abs(currentTheta) < pi/2
+                                TurnCreate(Robot, 0.2, rad2deg(-currentTheta+pi/2));
+                            elseif currentTheta > pi/2
+                                TurnCreate(Robot, 0.2, rad2deg(pi/2-currentTheta));
+                            else
+                                TurnCreate(Robot, 0.2, rad2deg(cureentTheta- 3/2*pi));
+                            end
                         end
                     end
                 
-                    midWall = 1/2 * [x2 + x1, y2 + y1];
+                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                    % Let robot moves straight until 
+                    % it reaches the wall/hit the wall
+                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
                     wall_here = 0;
                     
                     hit = 0;
-                    while norm([dataStore.truthPose(end, [2, 3])] - midWall)> 0 && hit == 0
+                    while norm([dataStore.truthPose(end, [2, 3])] - otherPt) > 0.2 && hit == 0
                         if any(dataStore.bump(end, [2, 3, 7]))
                             SetFwdVelAngVelCreate(Robot, 0, 0);
                             TravelDistCreate(Robot, 0.2, -0.3);
@@ -331,8 +349,14 @@ while toc < maxTime
                         else
                             SetFwdVelAngVelCreate(Robot, 0.2, 0);
                         end
+
                         [noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
-                    end                   
+                        if norm([dataStore.truthPose(end, [2, 3])] - otherPt) < 0.2
+                            hit = 1;
+                            SetFwdVelAngVelCreate(Robot, 0, 0);
+                        end
+                    end
+
                     SetFwdVelAngVelCreate(Robot, 0, 0);
 
                     if ~wall_here
@@ -404,7 +428,7 @@ while toc < maxTime
     end
     
 
-    dataStore.truthPose(end, :);
+    dataStore.truthPose(end, :)
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     pause(0.1);
     end
