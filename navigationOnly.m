@@ -50,7 +50,8 @@ dataStore = struct('truthPose', [],...
                    'deadReck', [],...
                    'map', [], ...
                    'visited', []),...
-                   'roadmap', {};
+                   'roadmap', {},...
+                   'nodesPath', {};
 % map: [toc (Indicator matrix)]
 %       Indicator matrix: for every index i, put 1 or 0 representing if
 %       optWalls(i, :) is in optional world
@@ -81,7 +82,7 @@ angles = transpose(angles);
 robotRadius = 0.2;
 
 % Wall offset
-off = robotRadius + 0.35;
+off = robotRadius + 0.4;
 
 alpha = 1;
 epsilon = 0.2;
@@ -183,7 +184,7 @@ mapVertices = polybuffer(poly, -off, "JointType","square").Vertices;
 [newXv, newYv, ~, nodes] = bufferMap(tempMap, off, off+0.05, mapVertices);
 % Get the basic visibility roadmap
 [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
-
+[nodeNum, ~] = size(nodes);
 % Start from the nearest next waypoint
 [iterNum, ~] = size(allWaypoints);
 path = [];
@@ -201,8 +202,11 @@ for i = 1 : iterNum
 end
 
 [pr, pc] = size(path);
-dataStore.roadmap{1} = [toc reshape(path, 1, pr*pc)];
+dataStore.roadmap{1} = [toc reshape(nodes, 1, nodeNum * 2)];
+dataStore.nodesPath{1} = [toc reshape(path, 1, pr*pc)];
+
 rmUpdate = 2;
+nodeUpdate = 2;
 gotopt = 1;
 
 [er, ~] = size(edges);
@@ -228,7 +232,7 @@ scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
 while toc < maxTime
     
     % READ & STORE SENSOR DATA
-    [noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
+    [noRobotCount,dataStore] = readStoreSensorData(Robot, noRobotCount, dataStore);
     
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     % CONTROL FUNCTION
@@ -242,13 +246,43 @@ while toc < maxTime
     waypointY = nextPt(1,2);
     cmdVx = waypointX - currentPoseX;
     cmdVy = waypointY - currentPoseY;
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % In case the robot hits the wall
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    bumped = dataStore.bump(end, [2, 3, 7]);
+    
+    if any(bumped)
+        SetFwdVelAngVelCreate(Robot, 0, 0);
+        TravelDistCreate(Robot, 0.2, -0.5);
+
+        %%%%%%%%%%%%%%%%%
+        % Relocalize here
+        %%%%%%%%%%%%%%%%%
+
+
+
+
+        %%%%%%%%%%%%%%%%%
+        % Find a new path
+        %%%%%%%%%%%%%%%%%
+        start = dataStore.truthPose(end, [2, 3]);
+        [path, ~] = findPath(nodes, edgeMatrix, start, allWaypoints(goalIndex, [1, 2]), newXv, newYv, factor);
+        gotopt = 1;
+        nextPt = path(gotopt,:);
+        waypointX = nextPt(1,1);
+        waypointY = nextPt(1,2);
+        cmdVx = waypointX - currentPoseX;
+        cmdVy = waypointY - currentPoseY;
+    end
     
     if ~all(isnan(allWaypoints))
         if sqrt((cmdVx)^2+(cmdVy)^2)<=closeEnough
-            gotopt = gotopt+1
+            gotopt = gotopt+1;
             if gotopt <= length(path)
                 hold on
                 plot([path(gotopt-1, 1), path(gotopt, 1)], [path(gotopt-1, 2), path(gotopt, 2)]);
+            
             else
                 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
                 % Step 1: Stop when the waypoint is reached
@@ -301,7 +335,7 @@ while toc < maxTime
                         % To the right
                         if currentPoseX > min(x1, x2)
                             if currentTheta >= 0
-                                TurnCreate(Robot, 0,2, rad2deg(pi-currentTheta));
+                                TurnCreate(Robot, 0.2, rad2deg(pi-currentTheta));
                             else
                                 TurnCreate(Robot, 0.2, -rad2deg((pi+currentTheta)));
                             end
@@ -340,6 +374,8 @@ while toc < maxTime
                     wall_here = 0;
                     
                     hit = 0;
+                    prevPose = [currentPoseX, currentPoseY];
+
                     while norm([dataStore.truthPose(end, [2, 3])] - otherPt) > 0.2 && hit == 0
                         if any(dataStore.bump(end, [2, 3, 7]))
                             SetFwdVelAngVelCreate(Robot, 0, 0);
@@ -351,7 +387,7 @@ while toc < maxTime
                         end
 
                         [noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
-                        if norm([dataStore.truthPose(end, [2, 3])] - otherPt) < 0.2
+                        if norm(prevPose - dataStore.truthPose(end, [2, 3])) > 0.7
                             hit = 1;
                             SetFwdVelAngVelCreate(Robot, 0, 0);
                         end
@@ -370,8 +406,8 @@ while toc < maxTime
                         [r, ~] = find(nodes(:, 3) == optWallNum+n);
                         nodes = [nodes(1: (min(r) - 1), :); [nodes((max(r)+1) : end, 1:2), nodes((max(r)+1):end, 3)-1]];
                         [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
-                        [pr, pc] = size(path);
-                        dataStore.roadmap{rmUpdate} = [toc reshape(path, 1, pr*pc)];
+                        [nodeNum, ~] = size(nodes);
+                        dataStore.roadmap{rmUpdate} = [toc reshape(nodes, 1, nodeNum * 2)];
                         rmUpdate = rmUpdate + 1;
                     end
                 end
@@ -388,18 +424,22 @@ while toc < maxTime
                             path = pathNodes;
                         end
                     end
-                gotopt = 1;
-                figure
-                for i = 1 : length(edges)
+                    [pr, pc] = size(path);
+                    dataStore.nodesPath{nodeUpdate} = [toc reshape(path, 1, pr * pc)];
+                    nodeUpdate = nodeUpdate + 1;
+                    gotopt = 1;
+
+                    figure
+                    for i = 1 : length(edges)
+                        hold on
+                        plot(edges(i, [1,3]), edges(i, [2, 4]), 'g-');
+                    end
                     hold on
-                    plot(edges(i, [1,3]), edges(i, [2, 4]), 'g-');
-                end
-                hold on
-                scatter(goal(1), goal(2), 'ro', 'LineWidth', 2);
-                hold on
-                scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
-                hold on
-                plotSquareMap(map);
+                    scatter(goal(1), goal(2), 'ro', 'LineWidth', 2);
+                    hold on
+                    scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
+                    hold on
+                    plotSquareMap(map);
                 else
                     break
                 end
