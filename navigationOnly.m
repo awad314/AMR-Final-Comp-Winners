@@ -33,6 +33,7 @@ catch
     CreatePort = Robot;
 end
 
+
 % declare dataStore as a global variable so it can be accessed from the
 % workspace even if the program is stopped
 global dataStore;
@@ -76,16 +77,19 @@ noRobotCount = 0;
 % Control Function Factors and Other Set Up
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Initialize the sensor range
-angles = linspace(deg2rad(27), deg2rad(-27), 9);
-angles = transpose(angles);
+anglesLine = linspace(deg2rad(27), deg2rad(-27), 9);
+anglesLine = transpose(anglesLine);
 
 robotRadius = 0.2;
 
-% Wall offset
-off = robotRadius + 0.4;
+% Wall offset for RoadMap
+off = robotRadius + 0.35;
+
+% Real Wall Offset
+offReal = 0.05;
 
 alpha = 1;
-epsilon = 0.2;
+epsilon = 0.15;
 
 % Number of subsections to take on one line
 factor = 50;
@@ -153,6 +157,89 @@ for i = 1 : k
 end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Run Particle Filter and Get Localization
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Parameters needed for particle filter
+numParticles = 500;
+[numWaypoints, ~] = size(data.waypoints);
+
+% Create fields in dataStore.particles: three K by 1 vectors storing the
+% pose (x, y theta) of each particle respectively, and a K by 1 matrix 
+% storing the weights of each particle
+init_set = randsample(1:numWaypoints, numParticles, true);
+dataStore.particles.x = [toc, data.waypoints(init_set, 1)'];
+dataStore.particles.y = [toc, data.waypoints(init_set, 2)'];
+dataStore.particles.theta = [toc, unifrnd(0, 2*pi, 1, numParticles)];
+dataStore.particles.weights = [toc, 1/numParticles*ones(1, numParticles)];
+
+% Initialize R, Q
+R = [1e-8,0,0;0,1e-8,0;0,0,0.01];
+sensorPos = [0,0.8];
+[nbeacon, ~] = size(beaconLoc);
+Q = 0.5*eye(2*nbeacon+9);
+Q(:, 1:2*nbeacon) = Q(:, 1:2*nbeacon)/1000;
+
+% Pass measurement and dynamics functions as anonymous functions
+h = @(x) [hBeacon(x, sensorPos, beaconLoc); depthPredict(x, data.map, sensorPos, linspace(3*pi/20, -3*pi/20, 9))];
+g = @(x,u) integrateOdom(reshape(x, [3,1]), u(1), u(2));
+
+% Rotate robot in full circle while running particle filter
+SetFwdVelAngVelCreate(Robot, 0, 0.4);
+deltaA = 0;
+while deltaA < 2*pi
+    % Read sensor data
+    [noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
+    
+    % Set up necessary inputs for particle filter
+    X_t_1 = [dataStore.particles.x(end, 2:(numParticles + 1))', dataStore.particles.y(end, 2:(numParticles + 1))', dataStore.particles.theta(end, 2:(numParticles + 1))'];
+    u_t = dataStore.odometry(end,2:3);
+    init_t = dataStore.truthPose(end,1);
+    
+    % Get tags for current time step
+    if isequal(dataStore.beacon, [])
+        tags = [];
+    else
+        tags = dataStore.beacon(dataStore.beacon(:,1) > init_t, 2:end);
+    end
+    z_t = [createMeasure(tags, beaconLoc); dataStore.rsdepth(end,3:11)'];
+    
+    % Run particle filter, save results in dataStore
+    [X_t, w] = PF(X_t_1, u_t, z_t, g, h, R, Q);
+    dataStore.particles.x(end + 1, :) = [toc, X_t(:,1)'];
+    dataStore.particles.y(end + 1, :) = [toc, X_t(:,2)'];
+    dataStore.particles.theta(end + 1, :) = [toc, X_t(:,3)'];
+    dataStore.particles.weights(end + 1, :) = [toc, w];
+
+    % Rotate robot, update angle turned
+    SetFwdVelAngVelCreate(Robot, 0, 0.4);
+    deltaA = deltaA + dataStore.odometry(end,3);
+    pause(0.1);
+end
+
+% Set velocity back to 0 
+SetFwdVelAngVelCreate(Robot, 0, 0);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EKF Initialization - dataStore and Covariance Matrices
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+n_rs_rays = 9;
+
+% Q and R Matricies
+Q = 0.08*eye(2*nbeacon + 9);
+Q(:, 1:2*nbeacon) = Q(:, 1:2*nbeacon)/1000;
+R = 0.01*eye(3);
+
+initSigma = [0.1,0,0,0,0.1,0,0,0,0.1];
+
+% Initalize to the truth pose
+[noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
+dataStore.ekfMu(1,:) = [toc, dataStore.truthPose(end, 2:4)];
+dataStore.ekfSigma(1,:) = [toc, reshape(initSigma, [1,9])];
+dataStore.deadReck(1,:) = [toc, dataStore.truthPose(1, 2:4)];
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Initialize other dataStore fields
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % We assume all walls are there
@@ -161,7 +248,7 @@ dataStore.map = [toc, ones(1, n+m)];
 dataStore.visited.waypoints = [toc, zeros(1, k)];
 % Update current waypoint as visited
 dataStore.visited.waypoints(1, currWaypoint + 1) = 1;
-% BeepRoombaCreate(Robot);
+BeepCreate(Robot);
 % Every other point should be marked as unvisited
 dataStore.visited.ECwaypoints = [toc, zeros(1, j)];
 
@@ -181,7 +268,8 @@ poly = polyshape(mapVertices(:, 1), mapVertices(:, 2));
 mapVertices = polybuffer(poly, -off, "JointType","square").Vertices;
 
 % Buffer the rest of the walls in the map and get new nodes
-[newXv, newYv, ~, nodes] = bufferMap(tempMap, off, off+0.05, mapVertices);
+[newXv, newYv, ~, nodes, realMap] = bufferMap(tempMap, off, off+0.05, offReal, mapVertices);
+realMap = [mapBoundary; realMap];
 % Get the basic visibility roadmap
 [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
 [nodeNum, ~] = size(nodes);
@@ -202,7 +290,7 @@ for i = 1 : iterNum
 end
 
 [pr, pc] = size(path);
-dataStore.roadmap{1} = [toc reshape(nodes, 1, nodeNum * 2)];
+dataStore.roadmap{1} = [toc reshape(nodes, 1, nodeNum * 3)];
 dataStore.nodesPath{1} = [toc reshape(path, 1, pr*pc)];
 
 rmUpdate = 2;
@@ -228,6 +316,12 @@ scatter(goal(1),goal(2), 'ro', 'LineWidth', 1.5);
 hold on
 scatter(start(1), start(2), 'k*', 'LineWidth', 1.5);
 
+% % Code for delay
+count = 1;
+t01 = 0;
+d0 = 0;
+phi0 = 0;
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 while toc < maxTime
     
@@ -235,11 +329,86 @@ while toc < maxTime
     [noRobotCount,dataStore] = readStoreSensorData(Robot, noRobotCount, dataStore);
     
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Add delay
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if count ~= 1
+        t01 = dataStore.odometry(end - 1,1);
+        d0 = dataStore.odometry(end - 1 , 2);
+        phi0 = dataStore.odometry(end - 1, 3);
+        count = count + 1;
+    end
+    
+    tn = dataStore.rsdepth(end,1);
+    t02 = dataStore.odometry(end,1);
+    d_n = dataStore.odometry(end,2) + (dataStore.odometry(end,2)- d0)/(t02 - t01)*(tn - t01);
+    phi_n = dataStore.odometry(end,3) + (dataStore.odometry(end,3)- phi0)/(t02 - t01)*(tn - t01);
+    u_t = [d_n; phi_n];
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % EKF - Anonymous Func Pass in integrateOdom as g function
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    g = @(pose, d, phi) integrateOdom(pose, d, phi);
+    Gjac = @(x, u) GjacDiffDrive(x, u);
+    dataStore.deadReck = [dataStore.deadReck; toc transpose( ...
+        g(transpose(dataStore.deadReck(end, 2:4)), ...
+        dataStore.odometry(end, 2), dataStore.odometry(end, 3)))];
+    
+    % Initialize previous states
+    mu_t_bar = transpose(dataStore.ekfMu(end, 2:end));
+    sigma_prev = reshape(dataStore.ekfSigma(end, 2:end), 3, 3);
+    u_t = dataStore.odometry(end, 2 : 3)';
+    
+    % Get the measurement data from real sense data
+    z_t = dataStore.rsdepth(end, 3:11)';
+
+    % Get beacon measurement
+    init_t = dataStore.odometry(end,1);
+    if isequal(dataStore.beacon, [])
+        tags = [];
+    else
+        tags = dataStore.beacon(dataStore.beacon(:,1) > init_t, 2:end);
+    end
+    z_beacon_t = createMeasure(tags, beaconLoc);
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % EKF - Getting Localization for MP
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    % Since the sensor will return 0 if the distance is less than 17.5cm, 
+    % we change it to NAN
+    [rowNum, colNum] = size(z_t);
+    for i = 1 : rowNum
+        if z_t(i) < 0.175 || z_t(i) > 10
+                z_t(i) = NaN;
+        end
+    end
+    z_t = [z_beacon_t; z_t];
+
+    % Slice all NaN values from map
+    map_EKF = realMap(~isnan(realMap(:,1)), :);
+
+    % Pass measurment function and its Jacobian as anonymous functions
+    measureJac = @(x) [HBeacont(x, [0,0.08], beaconLoc); HjacDepth(x, data.map, [0,0.08], 9)]; 
+    h = @(x) [hBeacon(x, [0,0.08], beaconLoc); depthPredict(x, data.map, [0,0.08], linspace(3*pi/20, -3*pi/20, 9))];
+    
+    
+    Q = 0.04*eye(2*nbeacon + 9);
+    Q(:, 1:2*nbeacon) = Q(:, 1:2*nbeacon)/1000;
+    R = 0.01*eye(3);
+    % Call the EKF function with depth measurement
+    [mu_depth, sigma_depth] = EKF(g, h, R, Q, mu_t_bar, sigma_prev, ...
+            u_t, z_t, Gjac, measureJac);
+
+    % Store the outputs in dataStore
+    dataStore.ekfMu = [dataStore.ekfMu; toc transpose(mu_depth)];
+    dataStore.ekfSigma = [dataStore.ekfSigma; toc reshape(sigma_depth, 1, 9)];
+
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     % CONTROL FUNCTION
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    currentPoseX = dataStore.truthPose(end, 2);
-    currentPoseY = dataStore.truthPose(end, 3);
-    currentTheta = dataStore.truthPose(end, 4);
+    currentPoseX = dataStore.ekfMu(end, 2);
+    currentPoseY = dataStore.ekfMu(end, 3);
+    currentTheta = dataStore.ekfMu(end, 4);
 
     nextPt = path(gotopt,:);
     waypointX = nextPt(1,1);
@@ -259,9 +428,63 @@ while toc < maxTime
         %%%%%%%%%%%%%%%%%
         % Relocalize here
         %%%%%%%%%%%%%%%%%
-
-
-
+        % Parameters needed for particle filter
+        numParticles = 500;
+        
+        % Create fields in dataStore.particles: three K by 1 vectors storing the
+        % pose (x, y theta) of each particle respectively, and a K by 1 matrix 
+        % storing the weights of each particle
+        dataStore.particles.x = [toc, dataStore.ekfMu(end, 2)*ones(1, numParticles)];
+        dataStore.particles.y = [toc, dataStore.ekfMu(end, 3)*ones(1, numParticles)];
+        dataStore.particles.theta = [toc, dataStore.ekfMu(end, 4)*ones(1, numParticles)];
+        dataStore.particles.weights = [toc, 1/numParticles*ones(1, numParticles)];
+        
+        % Initialize R, Q
+        R = [1e-8,0,0;0,1e-8,0;0,0,0.01];
+        sensorPos = [0,0.8];
+        [nbeacon, ~] = size(beaconLoc);
+        Q = 0.5*eye(2*nbeacon+9);
+        Q(:, 1:2*nbeacon) = Q(:, 1:2*nbeacon)/1000;
+        
+        % Pass measurement and dynamics functions as anonymous functions
+        h = @(x) [hBeacon(x, sensorPos, beaconLoc); depthPredict(x, data.map, sensorPos, linspace(3*pi/20, -3*pi/20, 9))];
+        g = @(x,u) integrateOdom(reshape(x, [3,1]), u(1), u(2));
+        
+        % Rotate robot in full circle while running particle filter
+        SetFwdVelAngVelCreate(Robot, 0, 0.4);
+        deltaA = 0;
+        while deltaA < 2*pi
+            % Read sensor data
+            [noRobotCount,dataStore] = readStoreSensorData(Robot,noRobotCount,dataStore);
+            
+            % Set up necessary inputs for particle filter
+            X_t_1 = [dataStore.particles.x(end, 2:(numParticles + 1))', dataStore.particles.y(end, 2:(numParticles + 1))', dataStore.particles.theta(end, 2:(numParticles + 1))'];
+            u_t = dataStore.odometry(end,2:3);
+            init_t = dataStore.truthPose(end,1);
+            
+            % Get tags for current time step
+            if isequal(dataStore.beacon, [])
+                tags = [];
+            else
+                tags = dataStore.beacon(dataStore.beacon(:,1) > init_t, 2:end);
+            end
+            z_t = [createMeasure(tags, beaconLoc); dataStore.rsdepth(end,3:11)'];
+            
+            % Run particle filter, save results in dataStore
+            [X_t, w] = PF(X_t_1, u_t, z_t, g, h, R, Q);
+            dataStore.particles.x(end + 1, :) = [toc, X_t(:,1)'];
+            dataStore.particles.y(end + 1, :) = [toc, X_t(:,2)'];
+            dataStore.particles.theta(end + 1, :) = [toc, X_t(:,3)'];
+            dataStore.particles.weights(end + 1, :) = [toc, w];
+        
+            % Rotate robot, update angle turned
+            SetFwdVelAngVelCreate(Robot, 0, 0.4);
+            deltaA = deltaA + dataStore.odometry(end,3);
+            pause(0.1);
+        end
+        
+        % Set velocity back to 0 
+        SetFwdVelAngVelCreate(Robot, 0, 0);
 
         %%%%%%%%%%%%%%%%%
         % Find a new path
@@ -299,7 +522,7 @@ while toc < maxTime
                     lastWaypoints = dataStore.visited.waypoints(end, 2 : end);
                     lastWaypoints(1, goalIndex) = 1;
                     dataStore.visited.waypoints = [dataStore.visited.waypoints; toc lastWaypoints];
-                    % BeepRoombaCreate(Robot);
+                    BeepCreate(Robot);
                     allWaypoints(goalIndex, :) = nan;
     
                 % If extraw waypoint
@@ -307,7 +530,7 @@ while toc < maxTime
                     lastECWaypoints = dataStore.visited.ECwaypoints(end, 2 : end);
                     lastECWaypoints(1, goalIndex - k) = 1;
                     dataStore.visited.ECwaypoints = [dataStore.visited.ECwaypoints; toc lastECWaypoints];
-                    % BeepRoombaCreate(Robot);
+                    BeepCreate(Robot);
                     allWaypoints(goalIndex, :) = nan;
             
                 % If extra wall node indices
@@ -399,6 +622,8 @@ while toc < maxTime
                         lastMap(1, optWallNum+n) = 0;
                         dataStore.map = [dataStore.map; toc lastMap];
 
+                        realMap(4*(optWallNum+n)+1 : 4*(optWallNum+n)+4, :) = NaN;
+
                         % Remove not there opt walls
                         newXv = [newXv(1:(n + optWallNum-1), :); newXv((n+optWallNum+1) : end, :)];
                         newYv = [newYv(1:(n + optWallNum-1), :); newYv((n+optWallNum+1) : end, :)];
@@ -407,7 +632,7 @@ while toc < maxTime
                         nodes = [nodes(1: (min(r) - 1), :); [nodes((max(r)+1) : end, 1:2), nodes((max(r)+1):end, 3)-1]];
                         [edgeMatrix, edges] = createRoadmap(newXv, newYv, nodes, factor);
                         [nodeNum, ~] = size(nodes);
-                        dataStore.roadmap{rmUpdate} = [toc reshape(nodes, 1, nodeNum * 2)];
+                        dataStore.roadmap{rmUpdate} = [toc reshape(nodes, 1, nodeNum * 3)];
                         rmUpdate = rmUpdate + 1;
                     end
                 end
@@ -468,7 +693,7 @@ while toc < maxTime
     end
     
 
-    dataStore.truthPose(end, :)
+    dataStore.truthPose(end, :);
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     pause(0.1);
     end
@@ -476,5 +701,134 @@ while toc < maxTime
 % set forward and angular velocity to zero (stop robot) before exiting the function
 SetFwdVelAngVelCreate(Robot, 0, 0);
 
+end
+
+function [mu_t, sigma_t] = EKF(g, h, R_t, Q_t, mu_t_1, sigma_t_1, u_t, z_t, Gjac, Hjac)
+% Inputs: 
+%       g           g(mu_(t-1), u_t) predicts the robot's current pose by
+%                   the control u_t and previous pose mu_(t-1)
+%       h           h(mu_t_bar) predicts the measurement by the mu_t_bar,
+%                   an output from g(mu_(t-1), u_t)
+%       R_t         a covariance matrix of dynamic noises (uncertainty)
+%       Q_t         a covariance matrix of the sensor measurement noises
+%       mu_t_1      mu_(t-1) is the mean of the robot's pose in previous
+%                   state
+%       sigma_t_1   sigma_(t-1) is the covariance matrix representing where 
+%                   the robot could be in previous state
+%       u_t         [distance; angleTurned] the control vector at time t 
+%       z_t         K by 4 measurement vector at time t
+%       Gjac        a function that returns G_t ->
+%                   the Jacobian matrix that corresponds to A_t and B_t in KF
+%       Hjac        a function that returns H_t
+%                   the Jacobian matrix that corresponds to C_t in KF
+%
+% Outputs:
+%       mu_t        the mean of robot's current pose
+%       sigma_t     the covariance matrix of the robot in current state
+%
+% EKF Algorithm:
+%       Predict     mu_t_bar = g(mu_(t-1), u_t)
+%                   sigma_t_bar = G_t * sigma_(t-1) * (G_t).' + R_t
+%       Kalman gain K_t = sigma_t_bar * (H_t).' * (H_t * sigma_t_bar *
+%                   (H_t).' + Q_t)^(-1)
+%       Update      mu_t = mu_t_bar + K_t*(z_t - h(mu_t_bar))
+%                   sigma_t = (I - K_t * H_t) * sigma_t_bar
+
+% Get the dimension of Q to help this function identify whether it is
+% working with GPS or depth measurement
+[row, col] = size(Q_t);
+
+% Get the output from Gjac
+G_t = Gjac(mu_t_1, u_t);
+
+% Prediction
+mu_t_bar = g(mu_t_1, u_t(1), u_t(2));
+sigma_t_bar = G_t * sigma_t_1 * (G_t).' + R_t;
+
+% Get the output from Hjac
+H_t = Hjac(mu_t_bar);
+% Expected measurement by h(mu_t_bar)
+z_t_bar_h = h(mu_t_bar);
+
+% Get the dimension of measurement data to decide the number of iterations
+[rowNum, colNum] = size(z_t);
+
+% Return the NAN status of each sensor measurement and store it in a rowNum
+% by 1 matrix
+nanCondition = ones(rowNum, 1);
+for i = 1 : rowNum
+     if isnan(z_t(i, :))
+         nanCondition(i, :) = 0;
+     end
+end
+
+% Declare an array that counts the number of ~NAN in each row
+count = sum(nanCondition == 1, 'all');
+
+if count == 0
+    mu_t = mu_t_bar;
+    sigma_t = sigma_t_bar;
+
+else
+
+    % Initialize mu_t and sigma_t
+    mu_t = mu_t_bar;
+    sigma_t = sigma_t_bar;
+
+    k_dimension = count;
+    index = 1;
+    
+    % Initialize H_t matrix
+    H_t_updated = zeros(k_dimension, 3);
+    % Initialize Q matrix
+    Q_t_updated = zeros(k_dimension);
+
+    z_t_bar_h_updated = [];
+    z_t_updated = [];
+    
+    for j = 1 : rowNum
+        if nanCondition(j, :)
+            % Select the scaling whose corresponding sensorData is not NAN
+            H_t_updated(index, :) = H_t(j, :);
+            Q_t_updated(index, index) = Q_t(j, j);
+
+            % We update only when:
+            % 1. This is for GPS, where Q_t is a 3 by 3 matrix
+            % 2. There is a small discrepency between measurement and
+            % prediction. In this case, I set a boundary of +- 20%.
+            if row == 3 || ...
+                (z_t_bar_h(j)/z_t(j) >= 0.82 && ...
+                z_t_bar_h(j)/z_t(j) <=1.2 && ...
+                ...% based on sensor_range
+                z_t_bar_h(j) >= 0.175 && ...
+                z_t_bar_h(j) <=10)
+                            
+                z_t_bar_h_updated = [z_t_bar_h_updated; z_t_bar_h(j)];
+                z_t_updated = [z_t_updated; z_t(j)];
+            
+            % By setting z_t_bar_h_updated (prediction to z_t (measurement) 
+            % here, we are actually omitting this piece of data together,
+            % since in mu_t update part, z_t_updated(j) -
+            % z_t_bar_h_updated(j) = 0, which means that we don't change
+            % mu_t here.
+             else
+                 z_t_bar_h_updated = [z_t_bar_h_updated; z_t(j)];
+                 z_t_updated = [z_t_updated; z_t(j)];
+             
+             end
+        index = index + 1;
+        end
+    end
+    
+
+    % Kalman gain
+    K_t = sigma_t_bar * (H_t_updated).' * (H_t_updated * sigma_t_bar * (H_t_updated).' + Q_t_updated)^(-1);
+    
+    % Update
+    if ~isempty(z_t_bar_h_updated) 
+        mu_t = mu_t_bar + K_t * (z_t_updated - z_t_bar_h_updated);
+        sigma_t = (eye(length(mu_t_1)) - K_t * H_t_updated) * sigma_t_bar;  
+    end
+end
 end
 
